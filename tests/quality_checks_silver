@@ -1,0 +1,338 @@
+/*
+===============================================================================
+Quality Checks
+===============================================================================
+Script Purpose:
+    This script performs various quality checks for data consistency, accuracy, 
+    and standardization across the 'silver' layer. It includes checks for:
+    - Null or duplicate primary keys.
+    - Unwanted spaces in string fields.
+    - Data standardization and consistency.
+    - Invalid date ranges and orders.
+    - Data consistency between related fields.
+
+Usage Notes:
+    - Run these checks after data loading Silver Layer.
+    - Investigate and resolve any discrepancies found during the checks.
+===============================================================================
+*/
+
+--BRONZE LAYER: DATA QUALITY CHECKS
+--check for duplicate IDs
+select cst_id, count(*) ID_Count from bronze.crm_cust_info
+group by cst_id 
+having count(*) > 1 or cst_id is NULL
+order by cst_id
+
+--check unwanted first and last names and genders 
+select cst_firstname from bronze.crm_cust_info
+where cst_firstname != TRIM(cst_firstname)
+
+select cst_lastname from bronze.crm_cust_info
+where cst_lastname != TRIM(cst_lastname)
+
+select cst_gndr from bronze.crm_cust_info
+where cst_gndr != TRIM(cst_gndr)
+
+select distinct cst_gndr from bronze.crm_cust_info
+--F, M and NULL
+--use more friendly way to represent those values with more meaningful values
+--and replace NULL with standard value
+
+select distinct cst_marital_status from bronze.crm_cust_info
+--S, M and NULL. Same thing with gender
+
+--check duplicate or null primary keys
+select prd_id, count(*) ID_Count from bronze.crm_prd_info
+group by prd_id 
+having count(*) > 1 or prd_id is NULL
+order by prd_id
+
+--INSERT CORRECTED DATA INTO THE SILVER TABLE
+insert into silver.crm_cust_info (
+cst_id,
+cst_key,
+cst_firstname,
+cst_lastname,
+cst_marital_status,
+cst_gndr,
+cst_create_date)
+select 
+cst_id,
+cst_key,
+TRIM(cst_firstname) as cst_firstname,
+TRIM(cst_lastname) as cst_lastname,
+--standardization/normalization below
+CASE 
+	When UPPER(TRIM(cst_marital_status)) = 'S' THEN 'Single'
+	When UPPER(TRIM(cst_marital_status)) = 'M' THEN 'Married'
+	ELSE 'N/A'
+END cst_marital_status,
+--standardization/normalization below
+CASE 
+	When UPPER(TRIM(cst_gndr)) = 'F' THEN 'Female'
+	When UPPER(TRIM(cst_gndr)) = 'M' THEN 'Male'
+	ELSE 'N/A'
+END cst_gndr,
+cst_create_date
+from (
+select *, 
+row_number() over (partition by cst_id order by cst_create_date desc) as flag_last
+from bronze.crm_cust_info) t where flag_last = 1
+
+---------------------------------------------------------------------------------------------------------------------------------
+select prd_nm from bronze.crm_prd_info
+where prd_nm != TRIM(prd_nm)
+
+--check for negative costs
+select prd_cost from bronze.crm_prd_info
+where prd_cost < 0 or prd_cost is null
+
+select distinct id from bronze.erp_px_cat_g1v2
+select sls_prd_key from bronze.crm_sales_details
+select distinct prd_line from bronze.crm_prd_info
+
+select * from bronze.crm_prd_info
+where prd_end_dt < prd_start_dt
+
+--handling NULL end dates
+select
+prd_id,
+prd_key,
+prd_nm,
+prd_start_dt,
+prd_end_dt,
+LEAD(prd_start_dt) over (partition by prd_key order by prd_start_dt)-1 as prd_end_dt_test --LEAN takes the data of the next record
+from bronze.crm_prd_info
+where prd_key in ('AC-HE-HL-U509-R', 'AC-HE-HL-U509')
+
+insert into silver.crm_prd_info (
+	prd_id,	
+	cat_id,    
+	prd_key,	
+	prd_nm,	
+	prd_cost,	
+	prd_line,	
+	prd_start_dt,
+	prd_end_dt)
+select 
+prd_id,
+replace(substring(prd_key, 1, 5), '-','_') as cat_id,
+substring(prd_key, 7, LEN(prd_key)) as prd_key,--used LEN because not all of them are of the same len
+prd_nm,
+isnull(prd_cost, 0) as prd_cost,
+CASE upper(trim(prd_line))
+	when 'M' then 'Mountain'
+	when 'R' then 'Road'
+	when 'S' then 'Other Sales'
+	when 'T' then 'Touring'
+	ELSE 'N/A'
+END prd_line,
+CAST(prd_start_dt as DATE) as prd_start_dt,
+CAST(LEAD(prd_start_dt) over (partition by prd_key order by prd_start_dt)-1 as date) as prd_end_dt_test --LEAD takes the data of the next record
+from bronze.crm_prd_info
+
+---AFTER INSERTION, QUALITY CHECKS--
+select prd_nm from silver.crm_prd_info
+where prd_nm != TRIM(prd_nm)
+--check for negative costs
+select prd_cost from silver.crm_prd_info
+where prd_cost < 0 or prd_cost is null
+--standarization and consistent prd lines
+select distinct prd_line from silver.crm_prd_info
+--invalid dates
+select * from silver.crm_prd_info where prd_end_dt < prd_start_dt
+---------------------------------------------------------------------------------------------------------------------------------
+insert into silver.crm_sales_details (
+	sls_ord_num ,
+	sls_prd_key,
+	sls_cust_id,
+	sls_order_dt,
+	sls_ship_dt,
+	sls_due_dt,
+	sls_sales,
+	sls_quantity,
+	sls_price
+)
+select 
+sls_ord_num,
+sls_prd_key,
+sls_cust_id,
+CASE WHEN
+	sls_order_dt = 0 or len(sls_order_dt) != 8 THEN NULL
+	ELSE CAST(CAST(sls_order_dt as varchar) as Date) --here we can't convert int to date
+END as sls_order_dt, 
+CASE WHEN
+	sls_ship_dt = 0 or len(sls_ship_dt) != 8 THEN NULL
+	ELSE CAST(CAST(sls_ship_dt as varchar) as Date) --here we can't convert int to date
+END as sls_ship_dt, 
+CASE WHEN
+	sls_due_dt = 0 or len(sls_due_dt) != 8 THEN NULL
+	ELSE CAST(CAST(sls_due_dt as varchar) as Date) --here we can't convert int to date
+END as sls_due_dt, 
+CASE 
+	WHEN sls_sales <= 0 
+		or sls_sales is NULL 
+		or sls_sales != sls_quantity * ABS(sls_price) --ABS() converts every number from negative to positive
+	THEN sls_quantity * ABS(sls_price)
+	ELSE sls_sales
+END as sls_sales,
+sls_quantity,
+CASE
+	WHEN sls_price <= 0 or sls_price is NULL THEN sls_sales/nullif(sls_quantity,0)
+	ELSE sls_price
+END as sls_price
+from bronze.crm_sales_details
+
+
+--where sls_ord_num != TRIM(sls_ord_num) --0 results: all good
+--where sls_prd_key not in (select prd_key from silver.crm_prd_info) --0 results: all good
+--where sls_cust_id not in (select cst_id from silver.crm_cust_info) --0 results: all good
+
+--check on the dates--
+--format: integers, meaning they can be negatives or 0s
+--length: dates should be 8 of length (yyyymmdd)
+--Logic: order date < ship date < due date
+select 
+nullif(sls_order_dt, 0) as sls_order_dt
+from silver.crm_sales_details
+where (sls_order_dt <= 0 OR len(sls_order_dt) != 8 OR len(sls_order_dt) > 8)
+
+select 
+nullif(sls_ship_dt, 0) as sls_order_dt
+from silver.crm_sales_details
+where (sls_ship_dt <= 0 OR len(sls_ship_dt) != 8 OR len(sls_ship_dt) > 8)
+
+select 
+nullif(sls_due_dt, 0) as sls_order_dt
+from silver.crm_sales_details
+where (sls_due_dt <= 0 OR len(sls_due_dt) != 8 OR len(sls_due_dt) > 8)
+
+select * from silver.crm_sales_details
+where CAST(CAST(sls_order_dt as varchar) as Date) < CAST(CAST(sls_ship_dt as varchar) as Date)
+
+select * from silver.crm_sales_details
+where sls_order_dt > sls_ship_dt or sls_ship_dt > sls_due_dt or sls_order_dt > sls_due_dt
+
+--check the calculations and sales numbers
+-- sales, quantity and price could be negative or NULL
+-- sales = quantity x price
+
+--IF sales <= 0 or NULL ==> derive it using quantity and price
+--IF price = 0 or NULL ==> calculate it using sales and quantity
+--IF price < 0 ==> convert it to positive value
+select
+sls_sales,
+sls_quantity,
+sls_price
+from silver.crm_sales_details
+where (sls_sales <= 0 or sls_quantity <= 0 or sls_price <= 0)
+or (sls_sales != sls_quantity * sls_price) 
+or sls_sales is NULL or sls_quantity is NULL or sls_price is NULL
+
+select * from silver.crm_sales_details
+---------------------------------------------------------------------------------------------------------------------------------
+--ERP tables
+select * from bronze.erp_cust_az12
+
+--check ID and key compatability
+select CID from bronze.erp_cust_az12 --same as cst_key but has extra preffix
+select cst_key from silver.crm_cust_info
+
+--check for logical dates, like a very old customer or future bdays
+select 
+CID,
+BDATE,
+gen
+from bronze.erp_cust_az12
+where bdate < '1924-01-01' or BDATE > getdate()
+
+--check possible values of gen
+select distinct gen from bronze.erp_cust_az12
+
+insert into silver.erp_cust_az12 (CID, BDATE, GEN)
+select 
+CASE 
+	WHEN cid like 'NAS%' THEN SUBSTRING(cid, 4, len(cid))
+	ELSE cid
+END as CID,
+CASE 
+	WHEN BDATE > getDate() THEN NULL
+	else BDATE
+END as bday,
+CASE 
+	WHEN TRIM(gen) in ('F','Female') THEN 'Female'
+	WHEN TRIM(gen) in ('M','Male') THEN 'Male'
+	else 'N/A'
+end as gen
+from bronze.erp_cust_az12
+
+select * from silver.erp_cust_az12
+
+---------------------------------------------------------------------------------------------------------------------------------
+--cst_key and cid should match but the cid has a seperator and cst_key doesn't. so we should remove it
+select cst_key from silver.crm_cust_info
+
+select 
+REPLACE(cid, '-','') as cid, 
+cntry from bronze.erp_loc_a101 
+where REPLACE(cid, '-','') not in (select cst_key from silver.crm_cust_info)
+
+--Data Standardization and Consistency
+select distinct cntry from bronze.erp_loc_a101
+order by cntry
+--Result for above: mix of NULLs and abriviations
+
+select Distinct cntry as old_cntry, 
+CASE 
+	WHEN TRIM(cntry) = 'DE' THEN 'Germany'
+	WHEN TRIM(cntry) in ('USA', 'US') THEN 'United States'
+	WHEN TRIM(cntry) = '' or cntry is NULL THEN 'N/A'
+	--WHEN TRIM(cntry) in ('', NULL) THEN 'N/A'
+	ELSE TRIM(cntry)
+END as cntry 
+from bronze.erp_loc_a101
+
+--main
+insert into silver.erp_loc_a101(cid, cntry)
+select 
+REPLACE(cid, '-','') as cid, 
+CASE 
+	WHEN TRIM(cntry) = 'DE' THEN 'Germany'
+	WHEN TRIM(cntry) in ('USA', 'US') THEN 'United States'
+	WHEN TRIM(cntry) = '' or cntry is NULL THEN 'N/A'
+	ELSE TRIM(cntry)
+END as cntry 
+from bronze.erp_loc_a101
+
+select * from silver.erp_loc_a101
+
+---------------------------------------------------------------------------------------------------------------------------------
+--crm cat_id should be the same as id
+
+--check unwanted spaces
+select * from bronze.erp_px_cat_g1v2
+where TRIM(cat) != cat 
+or TRIM(subcat) != subcat 
+OR TRIM(MAINTENANCE) != MAINTENANCE
+
+--Data Standardization and Consistency
+select distinct cat from bronze.erp_px_cat_g1v2
+order by cat
+
+select distinct subcat from bronze.erp_px_cat_g1v2
+order by subcat
+
+select distinct MAINTENANCE from bronze.erp_px_cat_g1v2
+order by MAINTENANCE
+
+--main
+insert into silver.erp_px_cat_g1v2 (id, cat, subcat, MAINTENANCE)
+select
+id, 
+cat, 
+subcat, 
+MAINTENANCE
+from bronze.erp_px_cat_g1v2
+
+select * from silver.erp_px_cat_g1v2
